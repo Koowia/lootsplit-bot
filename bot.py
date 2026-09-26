@@ -62,13 +62,14 @@ def format_details(op_type, details):
         data = json.loads(details)
     except (json.JSONDecodeError, TypeError):
         return details
-    if op_type == 'split':
+    base_type = op_type.removesuffix('_cancelled')
+    if base_type == 'split':
         return f"Сплит {data['amount']:,.0f} между {len(data['nicks'])} чел (по {data['per_person']:,.0f}): {', '.join(data['nicks'])}"
-    if op_type == 'pay':
+    if base_type == 'pay':
         return f"Выплата {data['nick']}: {data['amount']:,.0f}"
-    if op_type == 'pay_all':
+    if base_type == 'pay_all':
         return f"Массовая выплата {len(data['payouts'])} чел на {sum(data['payouts'].values()):,.0f}"
-    if op_type == 'set':
+    if base_type == 'set':
         return f"Баланс {data['nick']}: {data['old']:,.0f} → {data['new']:,.0f}"
     return details
 
@@ -108,8 +109,10 @@ async def sync_sheets():
     if sheet_players is None:
         return False
 
+    sheet_nicks = set()
     for item in sheet_players:
         nick = str(item['nick']).strip()
+        sheet_nicks.add(nick.lower())
         sheet_balance = int(item['balance'])
         player = get_player(nick)
         if player is None:
@@ -118,6 +121,16 @@ async def sync_sheets():
         elif sheet_balance != player[1] and player[1] == player[2]:
             db_run('UPDATE players SET balance = ?, last_pushed = ? WHERE lower(nick) = lower(?)', (sheet_balance, sheet_balance, nick))
             add_log('Таблица', 'sheet_edit', f'{nick}: {player[1]} → {sheet_balance}')
+
+    if len(sheet_nicks) >= 5:
+        removed = 0
+        for (nick,) in db_all('SELECT nick FROM players'):
+            if nick.lower() not in sheet_nicks:
+                db_run('DELETE FROM players WHERE lower(nick) = lower(?)', (nick,))
+                add_log('Таблица', 'sheet_remove', nick)
+                removed += 1
+        if removed > 0:
+            print(f'✅ Синк: удалено {removed} игроков (удалены из таблицы)')
 
     players = [{'nick': r[0], 'balance': r[1]} for r in db_all('SELECT nick, balance FROM players')]
     logs = [{'date': r[0], 'author': r[1], 'type': r[2], 'details': format_details(r[2], r[3])}
