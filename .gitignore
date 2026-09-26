@@ -1,0 +1,6 @@
+.env
+lootsplit.db
+startup_state.json
+__pycache__/
+.pytest_cache/
+*.db
