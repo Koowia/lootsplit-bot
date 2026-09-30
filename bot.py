@@ -1,4 +1,5 @@
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 import aiohttp
 import asyncio
@@ -161,17 +162,17 @@ def clean_nick(discord_nick: str) -> str:
     return nick.strip()
 
 
-async def resolve_target(ctx, raw: str) -> str:
+async def resolve_target(guild, raw: str) -> str:
     match = re.fullmatch(r'<@!?(\d+)>', raw.strip())
     if match:
-        member = ctx.guild.get_member(int(match.group(1)))
+        member = guild.get_member(int(match.group(1)))
         if member:
             return clean_nick(member.display_name)
     return clean_nick(raw.replace('@', '').strip())
 
 
-def officer_name(ctx) -> str:
-    return clean_nick(ctx.author.display_name)
+def officer_name(member) -> str:
+    return clean_nick(member.display_name)
 
 
 def find_member_by_nick(guild, nick):
@@ -182,11 +183,11 @@ def find_member_by_nick(guild, nick):
     return None
 
 
-async def notify_split_participants(ctx, nicks, per_person, author_name):
+async def notify_split_participants(guild, nicks, per_person, author_name):
     delivered = 0
     failed = []
     for nick in nicks:
-        member = find_member_by_nick(ctx.guild, nick)
+        member = find_member_by_nick(guild, nick)
         if member is None:
             failed.append(nick)
             continue
@@ -204,8 +205,8 @@ async def notify_split_participants(ctx, nicks, per_person, author_name):
     return delivered, failed
 
 
-def is_officer_ctx(ctx) -> bool:
-    return is_officer(ctx.author)
+def is_officer_interaction(interaction) -> bool:
+    return is_officer(interaction.user)
 
 
 def is_officer(member: discord.Member) -> bool:
@@ -250,6 +251,11 @@ def trigger_sync():
     asyncio.create_task(sync_sheets())
 
 
+async def nick_autocomplete(interaction: discord.Interaction, current: str):
+    rows = db_all("SELECT nick FROM players WHERE lower(nick) LIKE lower(?) ORDER BY nick LIMIT 25", (f"%{current}%",))
+    return [app_commands.Choice(name=r[0], value=r[0]) for r in rows]
+
+
 async def crash_alert_check():
     try:
         with open(STARTUP_STATE_FILE, encoding='utf-8') as f:
@@ -289,6 +295,13 @@ async def crash_alert_check():
             json.dump(state, f)
 
 
+async def send_app_error(interaction: discord.Interaction, embed):
+    if interaction.response.is_done():
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 @bot.event
 async def on_ready():
     db_init()
@@ -299,6 +312,9 @@ async def on_ready():
                 db_run('INSERT OR IGNORE INTO players (nick, balance, last_pushed) VALUES (?, ?, ?)',
                        (str(item['nick']).strip(), int(item['balance']), int(item['balance'])))
             print(f'✅ Миграция: импортировано {len(sheet_players)} игроков')
+    for guild in bot.guilds:
+        await bot.tree.sync(guild=guild)
+    await bot.tree.sync()
     print(f'✅ Бот {bot.user} запущен!')
     print('✅ SQLite подключена')
     periodic_sync.start()
@@ -328,35 +344,75 @@ async def daily_backup():
         print('⚠️ Бэкап не сохранился')
 
 
-@bot.event
-async def on_command_error(ctx, error):
-    if isinstance(error, commands.CommandNotFound):
-        embed = discord.Embed(
-            title='❌ Неизвестная команда',
-            description=f"Команда `{ctx.message.content.split()[0]}` не существует",
-            color=discord.Color.red()
-        )
-        embed.add_field(name='Что делать', value='Напиши `!help` чтобы увидеть список команд', inline=False)
-        await ctx.send(embed=embed)
-    elif isinstance(error, commands.CheckFailure):
-        await ctx.send(embed=access_denied())
-    elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(embed=text_embed('❌ Не хватает аргументов. Напиши `!help` для справки.', discord.Color.red()))
-    elif isinstance(error, commands.BadArgument):
-        await ctx.send(embed=text_embed('❌ Неверный формат аргументов. Напиши `!help` для справки.', discord.Color.red()))
+@bot.tree.error
+async def on_app_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        await send_app_error(interaction, access_denied())
+    elif isinstance(error, (app_commands.TransformerError, app_commands.CommandInvokeError)):
+        await send_app_error(interaction, text_embed('❌ Неверный формат аргумента. Проверь ввод и попробуй ещё раз.', discord.Color.red()))
     else:
-        print(f'⚠️ Ошибка: {error}')
+        print(f'⚠️ Ошибка команды: {type(error).__name__}: {error}')
+        await send_app_error(interaction, text_embed('❌ Ошибка выполнения команды. Попробуй позже.', discord.Color.red()))
 
 
-@bot.command(name='split')
-@commands.check(is_officer_ctx)
-async def split(ctx, amount: str, *, players_arg: str):
+@bot.tree.command(name='split', description='Распределить лут между игроками')
+@app_commands.check(is_officer_interaction)
+@app_commands.describe(
+    amount='Сумма: 24м, 24m или 24000000',
+    players='Ники текстом через пробел или запятую (для больших сплитов)',
+    nick1='Игрок 1 (выбери из списка)',
+    nick2='Игрок 2 (выбери из списка)',
+    nick3='Игрок 3 (выбери из списка)',
+    nick4='Игрок 4 (выбери из списка)',
+    nick5='Игрок 5 (выбери из списка)',
+    nick6='Игрок 6 (выбери из списка)',
+    nick7='Игрок 7 (выбери из списка)',
+    nick8='Игрок 8 (выбери из списка)',
+    nick9='Игрок 9 (выбери из списка)',
+    nick10='Игрок 10 (выбери из списка)',
+    nick11='Игрок 11 (выбери из списка)',
+    nick12='Игрок 12 (выбери из списка)',
+    nick13='Игрок 13 (выбери из списка)',
+    nick14='Игрок 14 (выбери из списка)',
+    nick15='Игрок 15 (выбери из списка)',
+    nick16='Игрок 16 (выбери из списка)',
+    nick17='Игрок 17 (выбери из списка)',
+    nick18='Игрок 18 (выбери из списка)',
+    nick19='Игрок 19 (выбери из списка)',
+    nick20='Игрок 20 (выбери из списка)'
+)
+async def split(interaction: discord.Interaction, amount: str, players: str | None = None,
+                nick1: str | None = None, nick2: str | None = None, nick3: str | None = None, nick4: str | None = None, nick5: str | None = None, nick6: str | None = None, nick7: str | None = None, nick8: str | None = None, nick9: str | None = None, nick10: str | None = None, nick11: str | None = None, nick12: str | None = None, nick13: str | None = None, nick14: str | None = None, nick15: str | None = None, nick16: str | None = None, nick17: str | None = None, nick18: str | None = None, nick19: str | None = None, nick20: str | None = None):
     total_amount = parse_amount(amount)
-    raw_nicks = [n.strip() for n in re.split(r'[,\s]+', players_arg) if n.strip()]
-    nicks = list(dict.fromkeys([await resolve_target(ctx, n) for n in raw_nicks]))
+    raw_nicks = []
+    if players:
+        raw_nicks += [n.strip() for n in re.split(r'[,\s]+', players) if n.strip()]
+    for value in (nick1,
+                  nick2,
+                  nick3,
+                  nick4,
+                  nick5,
+                  nick6,
+                  nick7,
+                  nick8,
+                  nick9,
+                  nick10,
+                  nick11,
+                  nick12,
+                  nick13,
+                  nick14,
+                  nick15,
+                  nick16,
+                  nick17,
+                  nick18,
+                  nick19,
+                  nick20):
+        if value:
+            raw_nicks.append(value)
+    nicks = list(dict.fromkeys([await resolve_target(interaction.guild, n) for n in raw_nicks]))
 
     if not nicks:
-        await ctx.send(embed=text_embed('❌ Укажи участников! Пример: `!split 30м @ник1, @ник2`', discord.Color.red()))
+        await send_app_error(interaction, text_embed('❌ Укажи участников: через поля nick1-20 или текстом в players', discord.Color.red()))
         return
 
     not_found = [n for n in nicks if get_player(n) is None]
@@ -366,8 +422,8 @@ async def split(ctx, amount: str, *, players_arg: str):
             description=f"Не найдены в базе: {', '.join(not_found)}",
             color=discord.Color.red()
         )
-        embed.add_field(name='Что делать', value='Проверь написание. Новых игроков добавляй в таблицу (столбец B), бот подхватит автоматически', inline=False)
-        await ctx.send(embed=embed)
+        embed.add_field(name='Что делать', value='Проверь написание. Новых игроков добавляй в таблицу, бот подхватит автоматически', inline=False)
+        await send_app_error(interaction, embed)
         return
 
     count = len(nicks)
@@ -376,13 +432,13 @@ async def split(ctx, amount: str, *, players_arg: str):
     for n in nicks:
         db_run('UPDATE players SET balance = balance + ? WHERE lower(nick) = lower(?)', (per_person, n))
 
-    add_log(officer_name(ctx), 'split', json.dumps({'amount': total_amount, 'per_person': per_person, 'nicks': nicks}, ensure_ascii=False))
+    add_log(officer_name(interaction.user), 'split', json.dumps({'amount': total_amount, 'per_person': per_person, 'nicks': nicks}, ensure_ascii=False))
 
-    delivered, failed = await notify_split_participants(ctx, nicks, per_person, officer_name(ctx))
+    delivered, failed = await notify_split_participants(interaction.guild, nicks, per_person, officer_name(interaction.user))
 
     embed = discord.Embed(
         title='✅ Лут распределен!',
-        description=f'**{ctx.author.display_name}** провел сплит',
+        description=f'**{interaction.user.display_name}** провел сплит',
         color=discord.Color.gold()
     )
     embed.add_field(name='Сумма к распределению', value=f'{total_amount:,.0f} 💰', inline=False)
@@ -396,29 +452,85 @@ async def split(ctx, amount: str, *, players_arg: str):
     embed.add_field(name='Уведомления', value=notice, inline=False)
 
     embed.set_footer(text=f'CoE LootSplit • {datetime.now().strftime("%d.%m.%Y")}')
-    await ctx.send(embed=embed)
+    await interaction.response.send_message(embed=embed)
     trigger_sync()
 
 
-@bot.command(name='pay')
-@commands.check(is_officer_ctx)
-async def pay(ctx, target: str | None = None):
-    if target is None or target.lower() == 'all':
-        rows = db_all('SELECT nick, balance FROM players WHERE balance > 0')
-        if not rows:
-            await ctx.send(embed=text_embed('❌ Нет игроков с положительным балансом', discord.Color.red()))
-            return
+for _i in range(1, 21):
+    async def _split_autocomplete(interaction: discord.Interaction, current: str):
+        return await nick_autocomplete(interaction, current)
+    split.autocomplete(f'nick{_i}')(_split_autocomplete)
+
+
+@bot.tree.command(name='pay', description='Выплатить накопленный баланс игроку')
+@app_commands.check(is_officer_interaction)
+@app_commands.describe(target='Ник игрока')
+async def pay(interaction: discord.Interaction, target: str):
+    target = await resolve_target(interaction.guild, target)
+    player = get_player(target)
+    if player is None:
+        await send_app_error(interaction, text_embed(f'❌ Игрок **{target}** не найден в базе', discord.Color.red()))
+        return
+    if player[1] == 0:
+        await send_app_error(interaction, text_embed(f'❌ У **{target}** баланс уже ноль', discord.Color.red()))
+        return
+    db_run('UPDATE players SET balance = 0 WHERE lower(nick) = lower(?)', (target,))
+    add_log(officer_name(interaction.user), 'pay', json.dumps({'nick': target, 'amount': player[1]}, ensure_ascii=False))
+
+    member = find_member_by_nick(interaction.guild, target)
+    if member:
+        try:
+            await member.send(embed=discord.Embed(
+                title=f'💸 Выплата | {GUILD_NAME}',
+                description=f'Тебе выплачено: **{player[1]:,}**\n💼 Баланс обнулён.\nВыплатил: {officer_name(interaction.user)}',
+                color=discord.Color.green()
+            ))
+        except Exception:
+            pass
+
+    embed = discord.Embed(
+        title=f'💸 Выплата: {target}',
+        color=discord.Color.green()
+    )
+    embed.add_field(name='Выдано', value=f'**{player[1]:,.0f}** 💰', inline=False)
+    embed.add_field(name='Баланс', value='0 (обнулён)', inline=False)
+    await interaction.response.send_message(embed=embed)
+    trigger_sync()
+
+
+@pay.autocomplete('target')
+async def pay_target_autocomplete(interaction: discord.Interaction, current: str):
+    return await nick_autocomplete(interaction, current)
+
+
+class PayAllConfirm(discord.ui.View):
+    def __init__(self, rows, author):
+        super().__init__(timeout=60)
+        self.rows = rows
+        self.author = author
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user == self.author
+
+    @discord.ui.button(label='✅ Подтвердить выплату', style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        for child in self.children:
+            child.disabled = True
+        await interaction.edit_original_response(view=self)
+
+        rows = self.rows
         total = sum(r[1] for r in rows)
         db_run('UPDATE players SET balance = 0 WHERE balance > 0')
-        add_log(officer_name(ctx), 'pay_all', json.dumps({'payouts': {r[0]: r[1] for r in rows}}, ensure_ascii=False))
+        add_log(officer_name(self.author), 'pay_all', json.dumps({'payouts': {r[0]: r[1] for r in rows}}, ensure_ascii=False))
 
         for nick, amount in {r[0]: r[1] for r in rows}.items():
-            member = find_member_by_nick(ctx.guild, nick)
+            member = find_member_by_nick(interaction.guild, nick)
             if member:
                 try:
                     await member.send(embed=discord.Embed(
                         title=f'💸 Выплата | {GUILD_NAME}',
-                        description=f'Тебе выплачено: **{amount:,}**\n💼 Баланс обнулён.\nВыплатил: {officer_name(ctx)}',
+                        description=f'Тебе выплачено: **{amount:,}**\n💼 Баланс обнулён.\nВыплатил: {officer_name(self.author)}',
                         color=discord.Color.green()
                     ))
                 except Exception:
@@ -430,45 +542,44 @@ async def pay(ctx, target: str | None = None):
         )
         embed.add_field(name='Выплачено игроков', value=f'{len(rows)} чел.', inline=True)
         embed.add_field(name='Общая сумма', value=f'{total:,.0f} 💰', inline=True)
-        await ctx.send(embed=embed)
-    else:
-        target = await resolve_target(ctx, target)
-        player = get_player(target)
-        if player is None:
-            await ctx.send(embed=text_embed(f'❌ Игрок **{target}** не найден в базе', discord.Color.red()))
-            return
-        if player[1] == 0:
-            await ctx.send(embed=text_embed(f'❌ У **{target}** баланс уже ноль', discord.Color.red()))
-            return
-        db_run('UPDATE players SET balance = 0 WHERE lower(nick) = lower(?)', (target,))
-        add_log(officer_name(ctx), 'pay', json.dumps({'nick': target, 'amount': player[1]}, ensure_ascii=False))
+        await interaction.followup.send(embed=embed)
+        trigger_sync()
 
-        member = find_member_by_nick(ctx.guild, target)
-        if member:
-            try:
-                await member.send(embed=discord.Embed(
-                    title=f'💸 Выплата | {GUILD_NAME}',
-                    description=f'Тебе выплачено: **{player[1]:,}**\n💼 Баланс обнулён.\nВыплатил: {officer_name(ctx)}',
-                    color=discord.Color.green()
-                ))
-            except Exception:
-                pass
-
-        embed = discord.Embed(
-            title=f'💸 Выплата: {target}',
-            color=discord.Color.green()
-        )
-        embed.add_field(name='Выдано', value=f'**{player[1]:,.0f}** 💰', inline=False)
-        embed.add_field(name='Баланс', value='0 (обнулён)', inline=False)
-        await ctx.send(embed=embed)
-    trigger_sync()
+    @discord.ui.button(label='❌ Отмена', style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(embed=text_embed('❌ Массовая выплата отменена'), view=self)
 
 
-@bot.command(name='balance')
-async def balance(ctx, *, nick: str | None = None):
+@bot.tree.command(name='payall', description='Выплатить ВСЕМ накопленные балансы')
+@app_commands.check(is_officer_interaction)
+async def payall(interaction: discord.Interaction):
+    rows = db_all('SELECT nick, balance FROM players WHERE balance > 0 ORDER BY balance DESC')
+    if not rows:
+        await send_app_error(interaction, text_embed('❌ Нет игроков с положительным балансом', discord.Color.red()))
+        return
+    total = sum(r[1] for r in rows)
+    top_lines = [f'• **{r[0]}** - {r[1]:,}' for r in rows[:10]]
+    if len(rows) > 10:
+        top_lines.append(f'... и ещё {len(rows) - 10}')
+    embed = discord.Embed(
+        title='⚠️ Подтверждение массовой выплаты',
+        description='\n'.join(top_lines),
+        color=discord.Color.orange()
+    )
+    embed.add_field(name='Игроков', value=f'{len(rows)} чел.', inline=True)
+    embed.add_field(name='Суммарно', value=f'**{total:,.0f}** 💰', inline=True)
+    embed.set_footer(text='Кнопки живут 60 секунд. Кнопки жмёт только вызвавший.')
+    await interaction.response.send_message(embed=embed, view=PayAllConfirm(rows, interaction.user))
+
+
+@bot.tree.command(name='balance', description='Проверить баланс')
+@app_commands.describe(nick='Ник игрока (пусто = свой баланс)')
+async def balance(interaction: discord.Interaction, nick: str | None = None):
     if nick is None:
-        nick = clean_nick(ctx.author.display_name)
-    nick = await resolve_target(ctx, nick)
+        nick = clean_nick(interaction.user.display_name)
+    nick = await resolve_target(interaction.guild, nick)
 
     player = get_player(nick)
     if player is None:
@@ -478,7 +589,7 @@ async def balance(ctx, *, nick: str | None = None):
             color=discord.Color.red()
         )
         embed.add_field(name='Возможные причины', value='• Опечатка в нике\n• Игрок не добавлен в таблицу\n• Другой ник в игре и Discord', inline=False)
-        await ctx.send(embed=embed)
+        await send_app_error(interaction, embed)
         return
 
     embed = discord.Embed(
@@ -486,54 +597,66 @@ async def balance(ctx, *, nick: str | None = None):
         color=discord.Color.blue()
     )
     embed.add_field(name='Текущий баланс', value=f'**{player[1]:,.0f}** 💰', inline=False)
-    await ctx.send(embed=embed)
+    await interaction.response.send_message(embed=embed)
 
 
-@bot.command(name='set')
-@commands.check(is_officer_ctx)
-async def set_balance(ctx, nick: str, amount: int):
-    nick = await resolve_target(ctx, nick)
+@balance.autocomplete('nick')
+async def balance_nick_autocomplete(interaction: discord.Interaction, current: str):
+    return await nick_autocomplete(interaction, current)
+
+
+@bot.tree.command(name='set', description='Ручная правка баланса')
+@app_commands.check(is_officer_interaction)
+@app_commands.describe(nick='Ник игрока', amount='Новый баланс целым числом')
+async def set_balance(interaction: discord.Interaction, nick: str, amount: int):
+    nick = await resolve_target(interaction.guild, nick)
     player = get_player(nick)
     if player is None:
-        await ctx.send(embed=text_embed(f'❌ Игрок **{nick}** не найден в базе', discord.Color.red()))
+        await send_app_error(interaction, text_embed(f'❌ Игрок **{nick}** не найден в базе', discord.Color.red()))
         return
     db_run('UPDATE players SET balance = ? WHERE lower(nick) = lower(?)', (amount, nick))
-    add_log(officer_name(ctx), 'set', json.dumps({'nick': nick, 'old': player[1], 'new': amount}, ensure_ascii=False))
-    await ctx.send(embed=text_embed(f'✅ Баланс **{nick}** изменён: **{player[1]:,}** → **{amount:,.0f}** 💰', discord.Color.green()))
+    add_log(officer_name(interaction.user), 'set', json.dumps({'nick': nick, 'old': player[1], 'new': amount}, ensure_ascii=False))
+    await interaction.response.send_message(embed=text_embed(f'✅ Баланс **{nick}** изменён: **{player[1]:,}** → **{amount:,.0f}** 💰', discord.Color.green()))
     trigger_sync()
 
 
-@bot.command(name='undo')
-@commands.check(is_officer_ctx)
-async def undo(ctx, op_id: int | None = None):
+@set_balance.autocomplete('nick')
+async def set_nick_autocomplete(interaction: discord.Interaction, current: str):
+    return await nick_autocomplete(interaction, current)
+
+
+@bot.tree.command(name='undo', description='Отменить операцию')
+@app_commands.check(is_officer_interaction)
+@app_commands.describe(op_id='Номер операции (пусто = отменить последнюю)')
+async def undo(interaction: discord.Interaction, op_id: int | None = None):
     if op_id is None:
         rows = db_all("SELECT id FROM operations WHERE op_type NOT LIKE '%cancelled%' AND op_type != 'undo' ORDER BY id DESC LIMIT 1")
         if not rows:
-            await ctx.send(embed=text_embed('❌ Нечего отменять', discord.Color.red()))
+            await send_app_error(interaction, text_embed('❌ Нечего отменять', discord.Color.red()))
             return
         op_id = rows[0][0]
 
     rows = db_all('SELECT op_type, details FROM operations WHERE id = ?', (op_id,))
     if not rows:
-        await ctx.send(embed=text_embed(f'❌ Операция #{op_id} не найдена', discord.Color.red()))
+        await send_app_error(interaction, text_embed(f'❌ Операция #{op_id} не найдена', discord.Color.red()))
         return
 
     op_type, details = rows[0]
 
     if op_type.endswith('cancelled'):
-        await ctx.send(embed=text_embed(f'❌ Операция #{op_id} уже была отменена', discord.Color.red()))
+        await send_app_error(interaction, text_embed(f'❌ Операция #{op_id} уже была отменена', discord.Color.red()))
         return
     if op_type == 'undo':
-        await ctx.send(embed=text_embed('❌ Отмену отменить нельзя', discord.Color.red()))
+        await send_app_error(interaction, text_embed('❌ Отмену отменить нельзя', discord.Color.red()))
         return
     if op_type.startswith('sheet'):
-        await ctx.send(embed=text_embed('❌ Операции из таблицы отменить нельзя — правь баланс через `!set`', discord.Color.red()))
+        await send_app_error(interaction, text_embed('❌ Операции из таблицы отменить нельзя. Правь баланс через `/set`', discord.Color.red()))
         return
 
     try:
         data = json.loads(details)
     except json.JSONDecodeError:
-        await ctx.send(embed=text_embed('❌ Операция в старом формате, автоматический откат невозможен. Используй `!set`', discord.Color.red()))
+        await send_app_error(interaction, text_embed('❌ Операция в старом формате, автоматический откат невозможен. Используй `/set`', discord.Color.red()))
         return
 
     if op_type == 'split':
@@ -551,23 +674,24 @@ async def undo(ctx, op_id: int | None = None):
         db_run('UPDATE players SET balance = ? WHERE lower(nick) = lower(?)', (data['old'], data['nick']))
         summary = f"правка {data['nick']}: возвращено {data['old']:,.0f}"
     else:
-        await ctx.send(embed=text_embed(f'❌ Тип {op_type} не поддерживает откат', discord.Color.red()))
+        await send_app_error(interaction, text_embed(f'❌ Тип {op_type} не поддерживает откат', discord.Color.red()))
         return
 
     db_run('UPDATE operations SET op_type = ? WHERE id = ?', (op_type + '_cancelled', op_id))
-    add_log(officer_name(ctx), 'undo', f'отменена операция #{op_id}: {summary}')
-    await ctx.send(embed=text_embed(f'✅ Операция #{op_id} отменена: {summary}', discord.Color.green()))
+    add_log(officer_name(interaction.user), 'undo', f'отменена операция #{op_id}: {summary}')
+    await interaction.response.send_message(embed=text_embed(f'✅ Операция #{op_id} отменена: {summary}', discord.Color.green()))
     trigger_sync()
 
 
-@bot.command(name='last')
-@commands.check(is_officer_ctx)
-async def last_ops(ctx, count: int = 5):
+@bot.tree.command(name='last', description='Последние операции')
+@app_commands.check(is_officer_interaction)
+@app_commands.describe(count='Сколько показать (по умолчанию 5, максимум 20)')
+async def last_ops(interaction: discord.Interaction, count: int = 5):
     if count > 20:
         count = 20
     rows = db_all('SELECT id, date, author, op_type, details FROM operations ORDER BY id DESC LIMIT ?', (count,))
     if not rows:
-        await ctx.send(embed=text_embed('📜 История пуста'))
+        await interaction.response.send_message(embed=text_embed('📜 История пуста'))
         return
     lines = []
     for r in rows:
@@ -578,53 +702,53 @@ async def last_ops(ctx, count: int = 5):
         description='\n'.join(lines),
         color=discord.Color.greyple()
     )
-    await ctx.send(embed=embed)
+    await interaction.response.send_message(embed=embed)
 
 
-@bot.command(name='sync')
-@commands.check(is_officer_ctx)
-async def manual_sync(ctx):
-    msg = await ctx.send(embed=text_embed('⏳ Синхронизирую с таблицей...'))
+@bot.tree.command(name='sync', description='Синхронизация с таблицей')
+@app_commands.check(is_officer_interaction)
+async def manual_sync(interaction: discord.Interaction):
+    await interaction.response.send_message(embed=text_embed('⏳ Синхронизирую с таблицей...'))
     success = await sync_sheets()
     if success:
-        await msg.edit(embed=text_embed('✅ Синхронизация завершена', discord.Color.green()))
+        await interaction.edit_original_response(embed=text_embed('✅ Синхронизация завершена', discord.Color.green()))
     else:
-        await msg.edit(embed=text_embed('❌ Синхронизация не удалась, попробуй позже', discord.Color.red()))
+        await interaction.edit_original_response(embed=text_embed('❌ Синхронизация не удалась, попробуй позже', discord.Color.red()))
 
 
-@bot.command(name='help')
-async def help_command(ctx):
+@bot.tree.command(name='help', description='Список команд')
+async def help_command(interaction: discord.Interaction):
     embed = discord.Embed(
         title='📖 CoE LootSplit - Команды',
         color=discord.Color.dark_gold()
     )
     embed.add_field(
         name='💰 Экономика',
-        value='`!balance` - свой баланс\n`!balance [ник]` - баланс игрока\n`!history` - своя история операций\n`!history [ник]` - история операции игрока\n`!week` - статистика за неделю',
+        value='`/balance` - свой баланс\n`/balance ник` - баланс игрока\n`/history` - своя история операций\n`/history ник` - история операций игрока\n`/week` - статистика за неделю',
         inline=False
     )
-    if is_officer(ctx.author):
+    if is_officer(interaction.user):
         embed.add_field(
             name='💸 Лут',
-            value='`!split <сумма> <ники>` - распределить\n`!pay <ник>` - выплатить всё\n`!pay all` - выплатить всех\n`!payouts` - балансы к выдаче',
+            value='`/split` - распределить лут\n`/pay` - выплатить игроку\n`/payall` - выплатить всем\n`/payouts` - балансы к выдаче',
             inline=False
         )
         embed.add_field(
             name='⚙️ Управление',
-            value='`!set <ник> <сумма>` - правка баланса\n`!undo [номер]` - отменить операцию (номер из `!last`)\n`!last` - история операций\n`!sync` - синхронизация с таблицей\n`!check` - полная диагностика бота',
+            value='`/set` - правка баланса\n`/undo` - отменить операцию\n`/last` - история операций\n`/sync` - синхронизация с таблицей\n`/check` - полная диагностика бота',
             inline=False
         )
         embed.color = discord.Color.gold()
         embed.set_footer(text=f'CoE LootSplit • {GUILD_NAME} • Режим: Офицер')
     else:
         embed.set_footer(text=f'CoE LootSplit • {GUILD_NAME}')
-    await ctx.send(embed=embed)
+    await interaction.response.send_message(embed=embed)
 
 
-@bot.command(name='check')
-@commands.check(is_officer_ctx)
-async def system_check(ctx):
-    msg = await ctx.send(embed=text_embed('🔍 Делаю диагностику...'))
+@bot.tree.command(name='check', description='Полная диагностика бота')
+@app_commands.check(is_officer_interaction)
+async def system_check(interaction: discord.Interaction):
+    await interaction.response.send_message(embed=text_embed('🔍 Делаю диагностику...'))
 
     checks = []
 
@@ -677,18 +801,19 @@ async def system_check(ctx):
         color=discord.Color.green() if all_ok else discord.Color.red()
     )
     embed.set_footer(text=f'CoE LootSplit • {datetime.now().strftime("%d.%m.%Y %H:%M")}')
-    await msg.edit(content='', embed=embed)
+    await interaction.edit_original_response(embed=embed)
 
 
-@bot.command(name='history')
-async def player_history(ctx, *, nick: str | None = None):
+@bot.tree.command(name='history', description='История операций игрока')
+@app_commands.describe(nick='Ник игрока (пусто = своя история)')
+async def player_history(interaction: discord.Interaction, nick: str | None = None):
     if nick is None:
-        nick = clean_nick(ctx.author.display_name)
-    nick = await resolve_target(ctx, nick)
+        nick = clean_nick(interaction.user.display_name)
+    nick = await resolve_target(interaction.guild, nick)
 
     player = get_player(nick)
     if player is None:
-        await ctx.send(embed=text_embed(f'❌ Игрок **{nick}** не найден в базе', discord.Color.red()))
+        await send_app_error(interaction, text_embed(f'❌ Игрок **{nick}** не найден в базе', discord.Color.red()))
         return
 
     rows = db_all('SELECT id, date, author, op_type, details FROM operations ORDER BY id DESC LIMIT 1000')
@@ -763,15 +888,20 @@ async def player_history(ctx, *, nick: str | None = None):
     else:
         embed.description = 'Операций за последние 1000 записей не найдено'
 
-    await ctx.send(embed=embed)
+    await interaction.response.send_message(embed=embed)
 
 
-@bot.command(name='week')
-async def weekly_stats(ctx):
-    nick = clean_nick(ctx.author.display_name)
+@player_history.autocomplete('nick')
+async def history_nick_autocomplete(interaction: discord.Interaction, current: str):
+    return await nick_autocomplete(interaction, current)
+
+
+@bot.tree.command(name='week', description='Статистика за календарную неделю')
+async def weekly_stats(interaction: discord.Interaction):
+    nick = clean_nick(interaction.user.display_name)
     player = get_player(nick)
     if player is None:
-        await ctx.send(embed=text_embed(f'❌ Игрок **{nick}** не найден в базе', discord.Color.red()))
+        await send_app_error(interaction, text_embed(f'❌ Игрок **{nick}** не найден в базе', discord.Color.red()))
         return
 
     now = datetime.now()
@@ -852,7 +982,7 @@ async def weekly_stats(ctx):
         elif last_week and base_type == 'split' and not cancelled:
             earned_prev += amount
 
-    week_label = f'{week_start.strftime("%d.%m")} — {(week_start + timedelta(days=6)).strftime("%d.%m")}'
+    week_label = f'{week_start.strftime("%d.%m")} - {(week_start + timedelta(days=6)).strftime("%d.%m")}'
     embed = discord.Embed(
         title=f'📊 Твоя неделя: {week_label}',
         color=discord.Color.gold()
@@ -883,16 +1013,16 @@ async def weekly_stats(ctx):
     lines.append(f'💼 Баланс сейчас: **{player[1]:,}**')
 
     embed.description = '\n'.join(lines)
-    await ctx.send(embed=embed)
+    await interaction.response.send_message(embed=embed)
 
 
-@bot.command(name='payouts')
-@commands.check(is_officer_ctx)
-async def payouts_list(ctx):
+@bot.tree.command(name='payouts', description='Кто ждёт выплат')
+@app_commands.check(is_officer_interaction)
+async def payouts_list(interaction: discord.Interaction):
     rows = db_all('SELECT nick, balance FROM players WHERE balance > 0 ORDER BY balance DESC')
 
     if not rows:
-        await ctx.send(embed=text_embed('💸 Никто не ждёт выплат - все балансы обнулены', discord.Color.green()))
+        await interaction.response.send_message(embed=text_embed('💸 Никто не ждёт выплат. Все балансы обнулены', discord.Color.green()))
         return
 
     total = sum(r[1] for r in rows)
@@ -906,8 +1036,8 @@ async def payouts_list(ctx):
         color=discord.Color.green()
     )
     embed.add_field(name='Суммарно', value=f'**{total:,.0f}** 💰', inline=False)
-    embed.set_footer(text='Выплата: !pay <ник> или !pay all')
-    await ctx.send(embed=embed)
+    embed.set_footer(text='Выплата: /pay или /payall')
+    await interaction.response.send_message(embed=embed)
 
 
 if __name__ == '__main__':
