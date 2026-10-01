@@ -9,6 +9,7 @@ import re
 import os
 import shutil
 import time
+import uuid
 from datetime import datetime, time as dt_time, timedelta
 
 DISCORD_TOKEN = os.environ.get('DISCORD_TOKEN', '')
@@ -45,6 +46,8 @@ def db_all(sql, params=()):
 
 def db_init():
     db_run('CREATE TABLE IF NOT EXISTS players (nick TEXT PRIMARY KEY, balance INTEGER NOT NULL DEFAULT 0, last_pushed INTEGER NOT NULL DEFAULT 0)')
+    db_run('CREATE TABLE IF NOT EXISTS sync_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+    db_run("INSERT OR IGNORE INTO sync_meta (key, value) VALUES ('source_id', ?)", (uuid.uuid4().hex,))
     db_run('CREATE TABLE IF NOT EXISTS operations (id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, author TEXT, op_type TEXT, details TEXT, synced INTEGER NOT NULL DEFAULT 0)')
 
 
@@ -75,37 +78,88 @@ def format_details(op_type, details):
     return details
 
 
+def sheet_json(result):
+    try:
+        value = json.loads(result)
+        if isinstance(value, dict):
+            return value
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return {'error': 'Google вернул некорректный ответ'}
+
+
 async def sheet_request(data, retries=3):
-    for attempt in range(retries):
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(GOOGLE_SCRIPT_URL, json=data, timeout=aiohttp.ClientTimeout(total=30)) as response:
-                    text = await response.text()
-                    if not text.startswith('{'):
-                        print(f'⚠️ Скрипт вернул не-JSON (попытка {attempt + 1}): {text[:200]}')
-                        if attempt < retries - 1:
-                            await asyncio.sleep(3)
-                            continue
-                    return text
-        except Exception as e:
-            print(f'⚠️ Ошибка запроса к скрипту (попытка {attempt + 1}): {type(e).__name__}')
+    """Keep cold-start retries; never dump HTML, URLs or payloads to the log."""
+    action = data.get('action', '?')
+    error = 'нет ответа'
+    async with aiohttp.ClientSession() as session:
+        for attempt in range(retries):
+            try:
+                async with session.post(
+                    GOOGLE_SCRIPT_URL, json=data,
+                    timeout=aiohttp.ClientTimeout(total=60), allow_redirects=False
+                ) as response:
+                    status = response.status
+                    if status in (301, 302, 303):
+                        location = response.headers.get('Location')
+                        if not location:
+                            raise ValueError('redirect without Location')
+                        text = ''
+                        for get_attempt in range(6):
+                            if get_attempt:
+                                await asyncio.sleep(2)
+                            async with session.get(location, timeout=aiohttp.ClientTimeout(total=60)) as reply:
+                                status = reply.status
+                                text = await reply.text()
+                                if status == 200 and text.lstrip().startswith('{'):
+                                    break
+                    else:
+                        text = await response.text()
+                value = sheet_json(text)
+                if status == 200 and not value.get('error'):
+                    return json.dumps(value, ensure_ascii=False)
+                error = str(value.get('error') or f'HTTP {status}')
+                if value.get('error') and value['error'] != 'Google вернул некорректный ответ':
+                    if value['error'] != 'busy, try again':
+                        print(f'⚠️ Google {action}: {error}')
+                        return json.dumps(value, ensure_ascii=False)
+                error = f'HTTP {status}: {error}'
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+                error = type(exc).__name__
             if attempt < retries - 1:
                 await asyncio.sleep(3)
-    return 'ERROR'
+    print(f'⚠️ Google {action}: {error} (после {retries} попыток)')
+    return json.dumps({'error': error}, ensure_ascii=False)
 
 
 async def sheet_get_players():
-    result = await sheet_request({'action': 'get_all'})
-    if result.startswith('ERROR'):
+    data = sheet_json(await sheet_request({'action': 'get_all'}))
+    raw = data.get('players')
+    if data.get('protocol') != 2:
+        print('⚠️ Google get_all: требуется новая опубликованная версия Apps Script (protocol 2)')
         return None
+    if data.get('error') or not isinstance(raw, list):
+        return None
+    players, seen = [], set()
     try:
-        data = json.loads(result)
-    except json.JSONDecodeError:
+        for item in raw:
+            nick = item['nick'].strip()
+            balance = item['balance']
+            if not nick or nick.lower() in seen:
+                raise ValueError('empty or duplicate nick')
+            if isinstance(balance, bool) or not isinstance(balance, (int, float)):
+                raise ValueError('balance must be numeric')
+            if int(balance) != balance:
+                raise ValueError('balance must be an integer')
+            players.append({'nick': nick, 'balance': int(balance)})
+            seen.add(nick.lower())
+    except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
+        print('⚠️ Google get_all: некорректные игроки; синк остановлен')
         return None
-    return data.get('players', [])
+    return players
 
 
-async def sync_sheets():
+async def _sync_sheets():
     sheet_players = await sheet_get_players()
     if sheet_players is None:
         return False
@@ -114,7 +168,11 @@ async def sync_sheets():
     for item in sheet_players:
         nick = str(item['nick']).strip()
         sheet_nicks.add(nick.lower())
-        sheet_balance = int(item['balance'])
+        try:
+            sheet_balance = int(item['balance'])
+        except (ValueError, TypeError):
+            print(f'⚠️ Пропуск строки с битым балансом: {nick!r} → {item["balance"]!r}')
+            continue
         player = get_player(nick)
         if player is None:
             db_run('INSERT INTO players (nick, balance, last_pushed) VALUES (?, ?, ?)', (nick, sheet_balance, sheet_balance))
@@ -134,23 +192,35 @@ async def sync_sheets():
             print(f'✅ Синк: удалено {removed} игроков (удалены из таблицы)')
 
     players = [{'nick': r[0], 'balance': r[1]} for r in db_all('SELECT nick, balance FROM players')]
-    logs = [{'date': r[0], 'author': r[1], 'type': r[2], 'details': format_details(r[2], r[3])}
-            for r in db_all('SELECT date, author, op_type, details FROM operations WHERE synced = 0')]
+    pending = db_all('SELECT id, date, author, op_type, details FROM operations WHERE synced = 0 ORDER BY id')
+    source_id = db_all("SELECT value FROM sync_meta WHERE key = 'source_id'")[0][0]
+    logs = [{'key': f'{source_id}:{r[0]}', 'date': r[1], 'author': r[2],
+             'type': r[3], 'details': format_details(r[3], r[4])} for r in pending]
     if not players:
         print('⚠️ Отказ синка: база пуста, таблица не тронута')
         return False
-    result = await sheet_request({'action': 'sync', 'players': players, 'logs': logs})
-    if result.startswith('ERROR'):
+
+    payload = {
+        'action': 'sync', 'protocol': 2, 'players': players, 'logs': logs,
+        'heartbeat': {'status': '🟢 Бот работает',
+                      'time': datetime.now().strftime('%d.%m.%Y %H:%M'),
+                      'players_count': len(players)}
+    }
+    result = sheet_json(await sheet_request(payload))
+    if (result.get('ok') is not True or result.get('protocol') != 2
+            or result.get('count') != len(players)):
+        print('⚠️ Синк не подтверждён; проверь опубликованную версию Apps Script')
         return False
 
-    db_run('UPDATE players SET last_pushed = balance')
-    db_run('UPDATE operations SET synced = 1 WHERE synced = 0')
-    await sheet_request({
-        'action': 'heartbeat',
-        'status': '🟢 Бот работает',
-        'time': datetime.now().strftime('%d.%m.%Y %H:%M'),
-        'players_count': len(players)
-    })
+    # A Discord command can change the DB while the HTTP request is in flight.
+    # Acknowledge the actual sent snapshot, never all current rows.
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.executemany('UPDATE players SET last_pushed = ? WHERE nick = ?',
+                         [(r['balance'], r['nick']) for r in players])
+        conn.executemany(
+            'UPDATE operations SET synced = 1 WHERE id = ? AND op_type = ? AND details = ?',
+            [(r[0], r[3], r[4]) for r in pending])
+    print(f'✅ Синк завершён: {len(players)} игроков, {len(logs)} логов')
     return True
 
 
@@ -247,8 +317,26 @@ def text_embed(text, color=None):
     return discord.Embed(description=text, color=color or discord.Color.greyple())
 
 
+sync_lock = asyncio.Lock()
+last_sync_ok = None
+last_sync_at = None
+
+
 def trigger_sync():
     asyncio.create_task(sync_sheets())
+
+
+async def sync_sheets():
+    global last_sync_ok, last_sync_at
+    async with sync_lock:
+        try:
+            success = await _sync_sheets()
+        except Exception as exc:
+            print(f'⚠️ Синк: {type(exc).__name__}: {exc}')
+            success = False
+        last_sync_ok = success
+        last_sync_at = datetime.now()
+        return success
 
 
 async def nick_autocomplete(interaction: discord.Interaction, current: str):
@@ -317,8 +405,10 @@ async def on_ready():
     await bot.tree.sync()
     print(f'✅ Бот {bot.user} запущен!')
     print('✅ SQLite подключена')
-    periodic_sync.start()
-    daily_backup.start()
+    if not periodic_sync.is_running():
+        periodic_sync.start()
+    if not daily_backup.is_running():
+        daily_backup.start()
     await crash_alert_check()
 
 
@@ -338,7 +428,7 @@ async def daily_backup():
         'players': players,
         'date': datetime.now().strftime('%d.%m.%Y %H:%M')
     })
-    if result.startswith('{'):
+    if sheet_json(result).get('ok') is True:
         print(f'✅ Бэкап сохранён: {len(players)} игроков')
     else:
         print('⚠️ Бэкап не сохранился')
@@ -782,7 +872,12 @@ async def system_check(interaction: discord.Interaction):
         checks.append(('Google API', f'ответ за {elapsed} с, в таблице игроков: {len(sheet_players)}', True))
 
     pending_logs = db_all('SELECT COUNT(*) FROM operations WHERE synced = 0')[0][0]
-    checks.append(('Синхронизация', f'неотправленных логов: {pending_logs}', pending_logs < 50))
+    sync_state = 'ещё не выполнялась после запуска'
+    if last_sync_at is not None:
+        sync_state = ('успешно' if last_sync_ok else 'ошибка') + last_sync_at.strftime(' в %H:%M:%S')
+    fresh = last_sync_at is not None and datetime.now() - last_sync_at < timedelta(minutes=HEARTBEAT_STALE_MIN)
+    checks.append(('Синхронизация', f'{sync_state}; неотправленных логов: {pending_logs}',
+                   last_sync_ok is True and fresh and pending_logs == 0))
 
     disk = shutil.disk_usage('/')
     free_gb = disk.free / (1024 ** 3)
