@@ -75,6 +75,8 @@ def format_details(op_type, details):
         return f"Массовая выплата {len(data['payouts'])} чел на {sum(data['payouts'].values()):,.0f}"
     if base_type == 'set':
         return f"Баланс {data['nick']}: {data['old']:,.0f} → {data['new']:,.0f}"
+    if base_type == 'compens':
+        return f"Компенсация {data['nick']}: +{data['amount']:,.0f}"
     return details
 
 
@@ -89,7 +91,6 @@ def sheet_json(result):
 
 
 async def sheet_request(data, retries=3):
-    """Keep cold-start retries; never dump HTML, URLs or payloads to the log."""
     action = data.get('action', '?')
     error = 'нет ответа'
     async with aiohttp.ClientSession() as session:
@@ -97,7 +98,7 @@ async def sheet_request(data, retries=3):
             try:
                 async with session.post(
                     GOOGLE_SCRIPT_URL, json=data,
-                    timeout=aiohttp.ClientTimeout(total=60), allow_redirects=False
+                    timeout=aiohttp.ClientTimeout(total=30), allow_redirects=False
                 ) as response:
                     status = response.status
                     if status in (301, 302, 303):
@@ -108,7 +109,7 @@ async def sheet_request(data, retries=3):
                         for get_attempt in range(6):
                             if get_attempt:
                                 await asyncio.sleep(2)
-                            async with session.get(location, timeout=aiohttp.ClientTimeout(total=60)) as reply:
+                            async with session.get(location, timeout=aiohttp.ClientTimeout(total=30)) as reply:
                                 status = reply.status
                                 text = await reply.text()
                                 if status == 200 and text.lstrip().startswith('{'):
@@ -162,7 +163,8 @@ async def sheet_get_players():
 async def _sync_sheets():
     sheet_players = await sheet_get_players()
     if sheet_players is None:
-        return False
+        print('⚠️ get_all не ответил, синк без проверки таблицы')
+        sheet_players = []
 
     sheet_nicks = set()
     for item in sheet_players:
@@ -190,6 +192,8 @@ async def _sync_sheets():
                 removed += 1
         if removed > 0:
             print(f'✅ Синк: удалено {removed} игроков (удалены из таблицы)')
+    elif not sheet_nicks:
+        print('⚠️ get_all пустой, пропускаем проверку удалений')
 
     players = [{'nick': r[0], 'balance': r[1]} for r in db_all('SELECT nick, balance FROM players')]
     pending = db_all('SELECT id, date, author, op_type, details FROM operations WHERE synced = 0 ORDER BY id')
@@ -200,20 +204,28 @@ async def _sync_sheets():
         print('⚠️ Отказ синка: база пуста, таблица не тронута')
         return False
 
-    payload = {
-        'action': 'sync', 'protocol': 2, 'players': players, 'logs': logs,
+    players.sort(key=lambda p: p['nick'].lower())
+    total = len(players)
+    CHUNK = 100
+    for offset in range(0, total, CHUNK):
+        chunk = players[offset:offset + CHUNK]
+        result = sheet_json(await sheet_request({
+            'action': 'sync_players', 'protocol': 2, 'offset': offset, 'players': chunk
+        }))
+        if result.get('ok') is not True:
+            print(f'⚠️ sync_players offset={offset}: {result.get("error")}')
+            return False
+
+    commit = sheet_json(await sheet_request({
+        'action': 'sync_commit', 'protocol': 2, 'total': total, 'logs': logs,
         'heartbeat': {'status': '🟢 Бот работает',
                       'time': datetime.now().strftime('%d.%m.%Y %H:%M'),
-                      'players_count': len(players)}
-    }
-    result = sheet_json(await sheet_request(payload))
-    if (result.get('ok') is not True or result.get('protocol') != 2
-            or result.get('count') != len(players)):
-        print('⚠️ Синк не подтверждён; проверь опубликованную версию Apps Script')
+                      'players_count': total}
+    }))
+    if commit.get('ok') is not True or commit.get('protocol') != 2 or commit.get('count') != total:
+        print(f'⚠️ sync_commit: {commit.get("error", "не подтверждён")}')
         return False
 
-    # A Discord command can change the DB while the HTTP request is in flight.
-    # Acknowledge the actual sent snapshot, never all current rows.
     with sqlite3.connect(DB_PATH) as conn:
         conn.executemany('UPDATE players SET last_pushed = ? WHERE nick = ?',
                          [(r['balance'], r['nick']) for r in players])
@@ -409,12 +421,29 @@ async def on_ready():
         periodic_sync.start()
     if not daily_backup.is_running():
         daily_backup.start()
+    if not warmup_google.is_running():
+        warmup_google.start()
     await crash_alert_check()
 
 
 @tasks.loop(minutes=SYNC_INTERVAL_MIN)
 async def periodic_sync():
     await sync_sheets()
+
+
+@tasks.loop(minutes=4)
+async def warmup_google():
+    players_count = db_all('SELECT COUNT(*) FROM players')[0][0]
+    result = await sheet_request({
+        'action': 'heartbeat',
+        'status': '🟢 Бот работает',
+        'time': datetime.now().strftime('%d.%m.%Y %H:%M'),
+        'players_count': players_count
+    })
+    if sheet_json(result).get('ok') is True:
+        print('🔥 Прогрев Google Script')
+    else:
+        print('⚠️ Прогрев не удался')
 
 
 @tasks.loop(time=dt_time(4, 0))
@@ -469,10 +498,13 @@ async def on_app_error(interaction: discord.Interaction, error: app_commands.App
     nick17='Игрок 17 (выбери из списка)',
     nick18='Игрок 18 (выбери из списка)',
     nick19='Игрок 19 (выбери из списка)',
-    nick20='Игрок 20 (выбери из списка)'
+    nick20='Игрок 20 (выбери из списка)',
+    nick21='Игрок 21 (выбери из списка)',
+    nick22='Игрок 22 (выбери из списка)'
 )
 async def split(interaction: discord.Interaction, amount: str, players: str | None = None,
-                nick1: str | None = None, nick2: str | None = None, nick3: str | None = None, nick4: str | None = None, nick5: str | None = None, nick6: str | None = None, nick7: str | None = None, nick8: str | None = None, nick9: str | None = None, nick10: str | None = None, nick11: str | None = None, nick12: str | None = None, nick13: str | None = None, nick14: str | None = None, nick15: str | None = None, nick16: str | None = None, nick17: str | None = None, nick18: str | None = None, nick19: str | None = None, nick20: str | None = None):
+                nick1: str | None = None, nick2: str | None = None, nick3: str | None = None, nick4: str | None = None, nick5: str | None = None, nick6: str | None = None, nick7: str | None = None, nick8: str | None = None, nick9: str | None = None, nick10: str | None = None, nick11: str | None = None, nick12: str | None = None, nick13: str | None = None, nick14: str | None = None, nick15: str | None = None, nick16: str | None = None, nick17: str | None = None, nick18: str | None = None, nick19: str | None = None, nick20: str | None = None, nick21: str | None = None, nick22: str | None = None):
+    await interaction.response.defer()
     total_amount = parse_amount(amount)
     raw_nicks = []
     if players:
@@ -496,7 +528,9 @@ async def split(interaction: discord.Interaction, amount: str, players: str | No
                   nick17,
                   nick18,
                   nick19,
-                  nick20):
+                  nick20,
+                  nick21,
+                  nick22):
         if value:
             raw_nicks.append(value)
     nicks = list(dict.fromkeys([await resolve_target(interaction.guild, n) for n in raw_nicks]))
@@ -542,27 +576,390 @@ async def split(interaction: discord.Interaction, amount: str, players: str | No
     embed.add_field(name='Уведомления', value=notice, inline=False)
 
     embed.set_footer(text=f'CoE LootSplit • {datetime.now().strftime("%d.%m.%Y")}')
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
     trigger_sync()
 
 
-for _i in range(1, 21):
+for _i in range(1, 23):
     async def _split_autocomplete(interaction: discord.Interaction, current: str):
         return await nick_autocomplete(interaction, current)
     split.autocomplete(f'nick{_i}')(_split_autocomplete)
+
+
+drafts = {}
+
+
+class DraftPlayerSelect(discord.ui.Select):
+    def __init__(self, author_id, page=0, search=""):
+        self.author_id = author_id
+        self.page = page
+        self.search = search
+
+        if search:
+            rows = db_all("SELECT nick FROM players WHERE lower(nick) LIKE lower(?) ORDER BY nick LIMIT 25", (f"%{search}%",))
+        else:
+            rows = db_all("SELECT nick FROM players ORDER BY nick LIMIT 25 OFFSET ?", (page * 25,))
+
+        options = [discord.SelectOption(label=r[0], value=r[0]) for r in rows]
+
+        if not options:
+            options = [discord.SelectOption(label="Никого не найдено", value="none")]
+
+        super().__init__(
+            placeholder=f"Выбери игроков... (стр. {page + 1})",
+            min_values=1,
+            max_values=min(25, len(options)),
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("❌ Это не твой черновик", ephemeral=True)
+            return
+
+        draft = drafts.get(self.author_id)
+        if not draft:
+            await interaction.response.send_message("❌ Черновик истёк. Начни заново: `/splitstart`", ephemeral=True)
+            return
+
+        if "none" in self.values:
+            await interaction.response.send_message("❌ Выбери реального игрока", ephemeral=True)
+            return
+
+        added = 0
+        for nick in self.values:
+            if nick not in draft['nicks']:
+                draft['nicks'].append(nick)
+                added += 1
+
+        draft['expires'] = datetime.now() + timedelta(minutes=30)
+
+        embed = discord.Embed(
+            title="📝 Черновик сплита",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="Выбрано игроков", value=f"**{len(draft['nicks'])}** чел.", inline=True)
+        embed.add_field(name="Добавлено сейчас", value=f"+{added}", inline=True)
+
+        if draft['nicks']:
+            list_text = '\n'.join(f"{i+1}. {n}" for i, n in enumerate(draft['nicks']))
+            embed.add_field(name=f"Все выбранные ({len(draft['nicks'])})", value=list_text, inline=False)
+
+        embed.set_footer(text="Черновик живёт 30 минут • /splitfinish сумма — завершить")
+
+        view = DraftView(self.author_id, self.page, self.search)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+
+class DraftView(discord.ui.View):
+    def __init__(self, author_id, page=0, search=""):
+        super().__init__(timeout=900)
+        self.author_id = author_id
+        self.page = page
+        self.search = search
+
+        self.add_item(DraftPlayerSelect(author_id, page, search))
+
+        if page > 0:
+            prev_btn = discord.ui.Button(label="◀️ Назад", style=discord.ButtonStyle.secondary)
+            prev_btn.callback = self.prev_page
+            self.add_item(prev_btn)
+
+        next_btn = discord.ui.Button(label="Вперёд ▶️", style=discord.ButtonStyle.secondary)
+        next_btn.callback = self.next_page
+        self.add_item(next_btn)
+
+        search_btn = discord.ui.Button(label="🔍 Поиск", style=discord.ButtonStyle.primary)
+        search_btn.callback = self.show_search
+        self.add_item(search_btn)
+
+        clear_btn = discord.ui.Button(label="🗑️ Очистить", style=discord.ButtonStyle.danger)
+        clear_btn.callback = self.clear_draft
+        self.add_item(clear_btn)
+
+    async def prev_page(self, interaction: discord.Interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("❌ Это не твой черновик", ephemeral=True)
+            return
+        self.page -= 1
+        await self.update_view(interaction)
+
+    async def next_page(self, interaction: discord.Interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("❌ Это не твой черновик", ephemeral=True)
+            return
+        self.page += 1
+        await self.update_view(interaction)
+
+    async def show_search(self, interaction: discord.Interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("❌ Это не твой черновик", ephemeral=True)
+            return
+
+        await interaction.response.send_modal(SearchModal(self.author_id))
+
+    async def clear_draft(self, interaction: discord.Interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("❌ Это не твой черновик", ephemeral=True)
+            return
+
+        draft = drafts.get(self.author_id)
+        if draft:
+            draft['nicks'] = []
+
+        embed = discord.Embed(
+            title="📝 Черновик сплита",
+            description="Список очищен",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="Выбрано игроков", value="0 чел.", inline=True)
+        embed.set_footer(text="Черновик живёт 30 минут • /splitfinish сумма — завершить")
+
+        view = DraftView(self.author_id)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    async def update_view(self, interaction: discord.Interaction):
+        draft = drafts.get(self.author_id)
+        if not draft:
+            await interaction.response.send_message("❌ Черновик истёк", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="📝 Черновик сплита",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="Выбрано игроков", value=f"**{len(draft['nicks'])}** чел.", inline=True)
+
+        if draft['nicks']:
+            list_text = '\n'.join(f"{i+1}. {n}" for i, n in enumerate(draft['nicks']))
+            embed.add_field(name=f"Все выбранные ({len(draft['nicks'])})", value=list_text, inline=False)
+
+        embed.set_footer(text="Черновик живёт 30 минут • /splitfinish сумма — завершить")
+
+        view = DraftView(self.author_id, self.page, self.search)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+
+class SearchModal(discord.ui.Modal):
+    def __init__(self, author_id):
+        super().__init__(title="Поиск игрока")
+        self.author_id = author_id
+        self.search_input = discord.ui.TextInput(
+            label="Введи часть ника",
+            placeholder="Например: Kow",
+            required=True,
+            max_length=50
+        )
+        self.add_item(self.search_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        search = self.search_input.value
+
+        draft = drafts.get(self.author_id)
+        if not draft:
+            await interaction.response.send_message("❌ Черновик истёк", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="📝 Черновик сплита",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="Выбрано игроков", value=f"**{len(draft['nicks'])}** чел.", inline=True)
+        embed.add_field(name="Поиск", value=f'"{search}"', inline=True)
+
+        if draft['nicks']:
+            list_text = '\n'.join(f"{i+1}. {n}" for i, n in enumerate(draft['nicks']))
+            embed.add_field(name=f"Все выбранные ({len(draft['nicks'])})", value=list_text, inline=False)
+
+        embed.set_footer(text="Черновик живёт 30 минут • /splitfinish сумма — завершить")
+
+        view = DraftView(self.author_id, 0, search)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+
+class DraftConfirm(discord.ui.View):
+    def __init__(self, nicks, amount, author):
+        super().__init__(timeout=60)
+        self.nicks = nicks
+        self.amount = amount
+        self.author = author
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user == self.author
+
+    @discord.ui.button(label='✅ Подтвердить сплит', style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        for child in self.children:
+            child.disabled = True
+        await interaction.edit_original_response(view=self)
+
+        count = len(self.nicks)
+        per_person = int(self.amount / count)
+        author_name = officer_name(self.author)
+
+        for n in self.nicks:
+            db_run('UPDATE players SET balance = balance + ? WHERE lower(nick) = lower(?)', (per_person, n))
+
+        add_log(author_name, 'split', json.dumps({
+            'amount': self.amount,
+            'per_person': per_person,
+            'nicks': self.nicks
+        }, ensure_ascii=False))
+
+        delivered, failed = await notify_split_participants(interaction.guild, self.nicks, per_person, author_name)
+
+        embed = discord.Embed(
+            title='✅ Лут распределен!',
+            description=f'**{self.author.display_name}** провел сплит (черновик)',
+            color=discord.Color.gold()
+        )
+        embed.add_field(name='Сумма к распределению', value=f'{self.amount:,.0f} 💰', inline=False)
+        embed.add_field(name='На человека', value=f'**{per_person:,.0f}** 💵', inline=False)
+        embed.add_field(name='Участников', value=f'{count} чел.', inline=True)
+
+        notice = f'📩 Уведомлено: {delivered}/{count}'
+        if failed:
+            shown = ', '.join(failed[:5]) + ('...' if len(failed) > 5 else '')
+            notice += f' (не найдены в Discord: {shown})'
+        embed.add_field(name='Уведомления', value=notice, inline=False)
+
+        embed.set_footer(text=f'CoE LootSplit • {datetime.now().strftime("%d.%m.%Y")}')
+        await interaction.followup.send(embed=embed)
+
+        if self.author.id in drafts:
+            del drafts[self.author.id]
+
+        trigger_sync()
+
+    @discord.ui.button(label='❌ Отмена', style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(embed=text_embed('❌ Сплит отменён'), view=self)
+        if self.author.id in drafts:
+            del drafts[self.author.id]
+
+
+@bot.tree.command(name='splitstart', description='Начать большой сплит (выбор из списка)')
+@app_commands.check(is_officer_interaction)
+async def split_start(interaction: discord.Interaction):
+    if interaction.user.id in drafts:
+        draft = drafts[interaction.user.id]
+        if datetime.now() < draft['expires']:
+            draft['expires'] = datetime.now() + timedelta(minutes=30)
+
+            embed = discord.Embed(
+                title="📝 Черновик сплита (продолжение)",
+                color=discord.Color.blue()
+            )
+            embed.add_field(name="Выбрано игроков", value=f"**{len(draft['nicks'])}** чел.", inline=True)
+
+            if draft['nicks']:
+                shown = draft['nicks'][-10:]
+                list_text = '\n'.join(f"{i+1}. {n}" for i, n in enumerate(shown))
+                if len(draft['nicks']) > 10:
+                    list_text = f"... и ещё {len(draft['nicks']) - 10}\n" + list_text
+                embed.add_field(name="Последние добавленные", value=list_text, inline=False)
+
+            embed.set_footer(text="Черновик живёт 30 минут • /splitfinish сумма — завершить • 🆕 Новый — начать заново")
+
+            view = DraftView(interaction.user.id)
+            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+            return
+
+    drafts[interaction.user.id] = {
+        'nicks': [],
+        'expires': datetime.now() + timedelta(minutes=30)
+    }
+
+    embed = discord.Embed(
+        title="📝 Новый сплит (черновик)",
+        description="Выбирай игроков из списка. Можно добавлять по 25 человек за раз.",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="Выбрано", value="0 чел.", inline=True)
+    embed.add_field(name="Лимит времени", value="30 минут", inline=True)
+    embed.set_footer(text="Когда все выбраны — напиши: /splitfinish сумма")
+
+    view = DraftView(interaction.user.id)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+@bot.tree.command(name='splitfinish', description='Завершить черновик и провести сплит')
+@app_commands.check(is_officer_interaction)
+@app_commands.describe(amount='Сумма: 50м, 50m или 50000000')
+async def split_finish(interaction: discord.Interaction, amount: str):
+    await interaction.response.defer(ephemeral=True)
+
+    draft = drafts.get(interaction.user.id)
+    if not draft:
+        await interaction.followup.send(
+            embed=text_embed('❌ Черновик не найден или истёк. Начни заново: `/splitstart`', discord.Color.red()),
+            ephemeral=True
+        )
+        return
+
+    if datetime.now() > draft['expires']:
+        del drafts[interaction.user.id]
+        await interaction.followup.send(
+            embed=text_embed('❌ Черновик истёк (30 минут). Начни заново: `/splitstart`', discord.Color.red()),
+            ephemeral=True
+        )
+        return
+
+    nicks = draft['nicks']
+    if not nicks:
+        await interaction.followup.send(
+            embed=text_embed('❌ В черновике никого нет. Сначала выбери игроков через `/splitstart`', discord.Color.red()),
+            ephemeral=True
+        )
+        return
+
+    total_amount = parse_amount(amount)
+    count = len(nicks)
+    per_person = int(total_amount / count)
+
+    not_found = [n for n in nicks if get_player(n) is None]
+    if not_found:
+        await interaction.followup.send(
+            embed=text_embed(f"❌ Не найдены в базе: {', '.join(not_found)}", discord.Color.red()),
+            ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title="⚠️ Подтверждение сплита",
+        color=discord.Color.orange()
+    )
+    embed.add_field(name="Игроков", value=f"**{count}** чел.", inline=True)
+    embed.add_field(name="Сумма", value=f"**{total_amount:,.0f}** 💰", inline=True)
+    embed.add_field(name="Каждому", value=f"**{per_person:,.0f}** 💵", inline=True)
+
+    shown = nicks[:10]
+    list_text = '\n'.join(f"• {n}" for n in shown)
+    if count > 10:
+        list_text += f"\n... и ещё {count - 10}"
+    embed.add_field(name="Участники", value=list_text, inline=False)
+
+    embed.set_footer(text="Кнопки живут 60 секунд")
+
+    view = DraftConfirm(nicks, total_amount, interaction.user)
+    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
 @bot.tree.command(name='pay', description='Выплатить накопленный баланс игроку')
 @app_commands.check(is_officer_interaction)
 @app_commands.describe(target='Ник игрока')
 async def pay(interaction: discord.Interaction, target: str):
+    await interaction.response.defer()
     target = await resolve_target(interaction.guild, target)
     player = get_player(target)
     if player is None:
-        await send_app_error(interaction, text_embed(f'❌ Игрок **{target}** не найден в базе', discord.Color.red()))
+        await interaction.followup.send(embed=text_embed(f'❌ Игрок **{target}** не найден в базе', discord.Color.red()))
         return
     if player[1] == 0:
-        await send_app_error(interaction, text_embed(f'❌ У **{target}** баланс уже ноль', discord.Color.red()))
+        await interaction.followup.send(embed=text_embed(f'❌ У **{target}** баланс уже ноль', discord.Color.red()))
         return
     db_run('UPDATE players SET balance = 0 WHERE lower(nick) = lower(?)', (target,))
     add_log(officer_name(interaction.user), 'pay', json.dumps({'nick': target, 'amount': player[1]}, ensure_ascii=False))
@@ -584,9 +981,8 @@ async def pay(interaction: discord.Interaction, target: str):
     )
     embed.add_field(name='Выдано', value=f'**{player[1]:,.0f}** 💰', inline=False)
     embed.add_field(name='Баланс', value='0 (обнулён)', inline=False)
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
     trigger_sync()
-
 
 @pay.autocomplete('target')
 async def pay_target_autocomplete(interaction: discord.Interaction, current: str):
@@ -715,6 +1111,41 @@ async def set_nick_autocomplete(interaction: discord.Interaction, current: str):
     return await nick_autocomplete(interaction, current)
 
 
+@bot.tree.command(name='compens', description='Добавить компенсацию к балансу игрока')
+@app_commands.check(is_officer_interaction)
+@app_commands.describe(nick='Ник игрока', amount='Сумма: 5м, 5m или 5000000')
+async def compens(interaction: discord.Interaction, nick: str, amount: str):
+    await interaction.response.defer()
+    nick = await resolve_target(interaction.guild, nick)
+    player = get_player(nick)
+    if player is None:
+        await interaction.followup.send(embed=text_embed(f'❌ Игрок **{nick}** не найден в базе', discord.Color.red()), ephemeral=True)
+        return
+    value = int(parse_amount(amount))
+    db_run('UPDATE players SET balance = balance + ? WHERE lower(nick) = lower(?)', (value, nick))
+    new_balance = get_player(nick)[1]
+    add_log(officer_name(interaction.user), 'compens', json.dumps({'nick': nick, 'amount': value}, ensure_ascii=False))
+
+    member = find_member_by_nick(interaction.guild, nick)
+    if member:
+        try:
+            await member.send(embed=discord.Embed(
+                title=f'🎁 Компенсация | {GUILD_NAME}',
+                description=f'Тебе выдана компенсация: **+{value:,}**\n💼 Баланс: **{new_balance:,}**\nВыдал: {officer_name(interaction.user)}',
+                color=discord.Color.teal()
+            ))
+        except Exception:
+            pass
+
+    await interaction.followup.send(embed=text_embed(f'✅ Компенсация **{nick}**: +{value:,.0f} 💰 (баланс: {new_balance:,})', discord.Color.green()))
+    trigger_sync()
+
+
+@compens.autocomplete('nick')
+async def compens_nick_autocomplete(interaction: discord.Interaction, current: str):
+    return await nick_autocomplete(interaction, current)
+
+
 @bot.tree.command(name='undo', description='Отменить операцию')
 @app_commands.check(is_officer_interaction)
 @app_commands.describe(op_id='Номер операции (пусто = отменить последнюю)')
@@ -763,6 +1194,9 @@ async def undo(interaction: discord.Interaction, op_id: int | None = None):
     elif op_type == 'set':
         db_run('UPDATE players SET balance = ? WHERE lower(nick) = lower(?)', (data['old'], data['nick']))
         summary = f"правка {data['nick']}: возвращено {data['old']:,.0f}"
+    elif op_type == 'compens':
+        db_run('UPDATE players SET balance = balance - ? WHERE lower(nick) = lower(?)', (data['amount'], data['nick']))
+        summary = f"компенсация {data['nick']}: снято {data['amount']:,.0f}"
     else:
         await send_app_error(interaction, text_embed(f'❌ Тип {op_type} не поддерживает откат', discord.Color.red()))
         return
@@ -820,12 +1254,12 @@ async def help_command(interaction: discord.Interaction):
     if is_officer(interaction.user):
         embed.add_field(
             name='💸 Лут',
-            value='`/split` - распределить лут\n`/pay` - выплатить игроку\n`/payall` - выплатить всем\n`/payouts` - балансы к выдаче',
+            value='`/split` - распределить лут (до 22 чел)\n`/splitstart` + `/splitfinish` - большой сплит (50+ чел, выбор из списка)\n`/pay` - выплатить игроку\n`/payall` - выплатить всем\n`/payouts` - балансы к выдаче',
             inline=False
         )
         embed.add_field(
             name='⚙️ Управление',
-            value='`/set` - правка баланса\n`/undo` - отменить операцию\n`/last` - история операций\n`/sync` - синхронизация с таблицей\n`/check` - полная диагностика бота',
+            value='`/set` - правка баланса\n`/compens` - компенсация (+сумма)\n`/undo` - отменить операцию\n`/last` - история операций\n`/sync` - синхронизация с таблицей\n`/check` - полная диагностика бота',
             inline=False
         )
         embed.color = discord.Color.gold()
