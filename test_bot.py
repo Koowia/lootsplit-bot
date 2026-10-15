@@ -1,6 +1,6 @@
 import json
-import bot
-from bot import parse_amount, plural, clean_nick, format_details
+import db
+from utils import parse_amount, plural, clean_nick, format_details
 
 
 def test_parse_amount_russian_m():
@@ -67,16 +67,16 @@ def test_format_details_unknown_type():
 
 
 def test_player_roundtrip(tmp_path, monkeypatch):
-    monkeypatch.setattr(bot, 'DB_PATH', str(tmp_path / 'test.db'))
-    bot.db_init()
-    bot.db_run('INSERT INTO players (nick, balance, last_pushed) VALUES (?, ?, ?)', ('Kowin', 100, 100))
-    assert bot.get_player('kowin')[1] == 100
-    assert bot.get_player('KOWIN')[1] == 100
+    monkeypatch.setattr(db, 'DB_PATH', str(tmp_path / 'test.db'))
+    db.db_init()
+    db.db_run('INSERT INTO players (nick, balance, last_pushed) VALUES (?, ?, ?)', ('Kowin', 100, 100))
+    assert db.get_player('kowin')[1] == 100
+    assert db.get_player('KOWIN')[1] == 100
 
 
 def test_add_log(tmp_path, monkeypatch):
-    monkeypatch.setattr(bot, 'DB_PATH', str(tmp_path / 'test.db'))
-    bot.db_init()
-    bot.add_log('Kowin', 'split', '{"test": 1}')
-    rows = bot.db_all('SELECT author, op_type FROM operations')
+    monkeypatch.setattr(db, 'DB_PATH', str(tmp_path / 'test.db'))
+    db.db_init()
+    db.add_log('Kowin', 'split', '{"test": 1}')
+    rows = db.db_all('SELECT author, op_type FROM operations')
     assert rows[0] == ('Kowin', 'split')
