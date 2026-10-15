@@ -9,7 +9,7 @@ from db import db_all, db_run, get_player, add_log
 from utils import format_details
 
 
-def sheet_json(result):
+def sheet_json(result: str) -> dict:
     try:
         value = json.loads(result)
         if isinstance(value, dict):
@@ -19,7 +19,7 @@ def sheet_json(result):
     return {'error': 'Google вернул некорректный ответ'}
 
 
-async def sheet_request(data, retries=3):
+async def sheet_request(data: dict, retries: int = 3) -> str:
     action = data.get('action', '?')
     error = 'нет ответа'
     async with aiohttp.ClientSession() as session:

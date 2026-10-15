@@ -80,3 +80,11 @@ def test_add_log(tmp_path, monkeypatch):
     db.add_log('Kowin', 'split', '{"test": 1}')
     rows = db.db_all('SELECT author, op_type FROM operations')
     assert rows[0] == ('Kowin', 'split')
+
+
+def test_sheet_json_valid():
+    assert sheet_json('{"ok": true}') == {'ok': True}
+
+
+def test_sheet_json_invalid():
+    assert sheet_json('not json') == {'error': 'Google вернул некорректный ответ'}

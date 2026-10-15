@@ -41,7 +41,7 @@ def db_init():
         conn.execute("INSERT OR IGNORE INTO sync_meta (key, value) VALUES ('source_id', ?)", (uuid.uuid4().hex,))
 
 
-def get_player(nick):
+def get_player(nick: str) -> tuple[str, int, int] | None:
     rows = db_all('SELECT nick, balance, last_pushed FROM players WHERE lower(nick) = lower(?)', (nick,))
     return rows[0] if rows else None
 

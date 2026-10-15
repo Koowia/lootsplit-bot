@@ -51,7 +51,7 @@ def parse_amount(raw: str) -> float:
     return float(raw)
 
 
-def plural(n: int, forms: tuple) -> str:
+def plural(n: int, forms: tuple[str, str, str]) -> str:
     n = abs(n) % 100
     if 10 < n < 20:
         return forms[2]
