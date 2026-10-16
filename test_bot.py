@@ -1,5 +1,6 @@
 import json
 import db
+from sheets import sheet_json
 from utils import parse_amount, plural, clean_nick, format_details
 
 
@@ -88,3 +89,11 @@ def test_sheet_json_valid():
 
 def test_sheet_json_invalid():
     assert sheet_json('not json') == {'error': 'Google вернул некорректный ответ'}
+
+
+def test_sheet_json_empty():
+    assert sheet_json('') == {'error': 'Google вернул некорректный ответ'}
+
+
+def test_sheet_json_not_dict():
+    assert sheet_json('[1, 2, 3]') == {'error': 'Google вернул некорректный ответ'}
